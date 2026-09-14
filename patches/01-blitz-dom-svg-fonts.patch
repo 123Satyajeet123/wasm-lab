@@ -1,0 +1,80 @@
+diff --git a/packages/blitz-dom/src/lib.rs b/packages/blitz-dom/src/lib.rs
+index 04382e6..82f9dbf 100644
+--- a/packages/blitz-dom/src/lib.rs
++++ b/packages/blitz-dom/src/lib.rs
+@@ -121,6 +121,8 @@ pub type SelectorList = selectors::SelectorList<style::selector_parser::Selector
+ pub use events::{EventDriver, EventHandler, NoopEventHandler};
+ pub use html::{DummyHtmlParserProvider, HtmlParserProvider};
+ pub use util::{Point, decode_font_bytes};
++#[cfg(feature = "svg")]
++pub use util::register_svg_fonts;
+ 
+ /// Convenience builder for the one-font case: produces a [`FontContext`] with
+ /// system-font discovery disabled and the supplied font registered as the
+diff --git a/packages/blitz-dom/src/util.rs b/packages/blitz-dom/src/util.rs
+index dcad882..bc6636c 100644
+--- a/packages/blitz-dom/src/util.rs
++++ b/packages/blitz-dom/src/util.rs
+@@ -40,16 +40,51 @@ pub fn decode_font_bytes(bytes: &[u8]) -> Cow<'_, [u8]> {
+ }
+ 
+ #[cfg(feature = "svg")]
+-use std::sync::{Arc, LazyLock};
++use std::sync::{Arc, LazyLock, RwLock};
+ #[cfg(feature = "svg")]
+ use usvg::fontdb;
++
+ #[cfg(feature = "svg")]
+-pub(crate) static FONT_DB: LazyLock<Arc<fontdb::Database>> = LazyLock::new(|| {
++static SYSTEM_FONT_DB: LazyLock<Arc<fontdb::Database>> = LazyLock::new(|| {
+     let mut db = fontdb::Database::new();
+     db.load_system_fonts();
+     Arc::new(db)
+ });
+ 
++#[cfg(feature = "svg")]
++static SUPPLIED_FONT_DB: RwLock<Option<Arc<fontdb::Database>>> = RwLock::new(None);
++
++/// Register the font faces used for SVG `<text>`.
++///
++/// SVG text is shaped through usvg's own font database, which is separate from
++/// the `parley::FontContext` in `DocumentConfig`. Without this, that database
++/// is populated only by `load_system_fonts()`, so SVG text renders blank in any
++/// environment that has none — notably WASM.
++#[cfg(feature = "svg")]
++pub fn register_svg_fonts(faces: &[&[u8]]) {
++    let mut db = fontdb::Database::new();
++    for face in faces {
++        db.load_font_data(face.to_vec());
++    }
++    let family = db.faces().next().map(|face| face.families[0].0.clone());
++    if let Some(name) = family {
++        db.set_sans_serif_family(name.clone());
++        db.set_serif_family(name.clone());
++        db.set_monospace_family(name.clone());
++        db.set_cursive_family(name.clone());
++        db.set_fantasy_family(name);
++    }
++    *SUPPLIED_FONT_DB.write().unwrap() = Some(Arc::new(db));
++}
++
++#[cfg(feature = "svg")]
++pub(crate) fn svg_font_db() -> Arc<fontdb::Database> {
++    if let Some(db) = SUPPLIED_FONT_DB.read().unwrap().as_ref() {
++        return Arc::clone(db);
++    }
++    Arc::clone(&SYSTEM_FONT_DB)
++}
++
+ /// Which kind of CSS image layer list (`background-image` or `mask-image`) to
+ /// flush from style to dedicated storage on the node.
+ #[derive(Clone, Copy, Debug)]
+@@ -157,7 +192,7 @@ pub fn walk_tree(indent: usize, node: &Node) {
+ #[cfg(feature = "svg")]
+ pub(crate) fn parse_svg_image(source: &[u8]) -> Result<crate::node::SvgImageData, usvg::Error> {
+     let options = usvg::Options {
+-        fontdb: Arc::clone(&*FONT_DB),
++        fontdb: svg_font_db(),
+         ..Default::default()
+     };
+     crate::node::SvgImageData::from_data(source, &options)
