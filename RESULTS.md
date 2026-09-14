@@ -371,10 +371,11 @@ Repro in `repro/svg-text-blank-on-wasm.html`, evidence in `out/svgbug_sbs.png`.
 
 ### Fixed, and the fix is tested
 
-Patched in the local clone: `FONT_DB` becomes a system-font fallback behind a
-supplied database, with a public `register_svg_fonts(&[&[u8]])` that also sets
-the generic families so `font-family: sans-serif` resolves. One call site, ~25
-lines.
+Fixed by resolving SVG text through the document's Fontique collection, so
+`DocumentConfig::font_ctx` is the only font knob. usvg's own database starts
+empty and a `FontResolver` adds faces on demand. (The first attempt added a
+second database; the maintainers asked for the resolver, which is better: there
+is then nothing to keep in sync.)
 
 ```
                               SVG ink pixels

@@ -1,80 +1,277 @@
-diff --git a/packages/blitz-dom/src/lib.rs b/packages/blitz-dom/src/lib.rs
-index 04382e6..82f9dbf 100644
---- a/packages/blitz-dom/src/lib.rs
-+++ b/packages/blitz-dom/src/lib.rs
-@@ -121,6 +121,8 @@ pub type SelectorList = selectors::SelectorList<style::selector_parser::Selector
- pub use events::{EventDriver, EventHandler, NoopEventHandler};
- pub use html::{DummyHtmlParserProvider, HtmlParserProvider};
- pub use util::{Point, decode_font_bytes};
-+#[cfg(feature = "svg")]
-+pub use util::register_svg_fonts;
+diff --git a/packages/blitz-dom/src/layout/construct.rs b/packages/blitz-dom/src/layout/construct.rs
+index 106eab3..b157254 100644
+--- a/packages/blitz-dom/src/layout/construct.rs
++++ b/packages/blitz-dom/src/layout/construct.rs
+@@ -549,7 +549,7 @@ fn collect_layout_children_with_wrap(
+                 doc.nodes[id].remove_damage(CONSTRUCT_BOX | CONSTRUCT_DESCENDENT | CONSTRUCT_FC);
+             });
  
- /// Convenience builder for the one-font case: produces a [`FontContext`] with
- /// system-font discovery disabled and the supplied font registered as the
-diff --git a/packages/blitz-dom/src/util.rs b/packages/blitz-dom/src/util.rs
-index dcad882..bc6636c 100644
---- a/packages/blitz-dom/src/util.rs
-+++ b/packages/blitz-dom/src/util.rs
-@@ -40,16 +40,51 @@ pub fn decode_font_bytes(bytes: &[u8]) -> Cow<'_, [u8]> {
+-            match crate::util::parse_svg_image(outer_html.as_bytes()) {
++            match crate::util::parse_svg_image(outer_html.as_bytes(), doc.font_ctx.clone()) {
+                 Ok(svg) => {
+                     doc.get_node_mut(container_node_id)
+                         .unwrap()
+diff --git a/packages/blitz-dom/src/layout/damage.rs b/packages/blitz-dom/src/layout/damage.rs
+index b352ffb..0990398 100644
+--- a/packages/blitz-dom/src/layout/damage.rs
++++ b/packages/blitz-dom/src/layout/damage.rs
+@@ -516,7 +516,7 @@ impl BaseDocument {
+                                 doc_id,
+                                 None, // Don't pass node_id, we'll handle via pending_images
+                                 self.shell_provider.clone(),
+-                                ImageHandler::new(kind.image_type(idx)),
++                                ImageHandler::new(kind.image_type(idx), self.font_ctx.clone()),
+                             ),
+                         );
+ 
+diff --git a/packages/blitz-dom/src/mutator.rs b/packages/blitz-dom/src/mutator.rs
+index fef8ccf..4bf0b75 100644
+--- a/packages/blitz-dom/src/mutator.rs
++++ b/packages/blitz-dom/src/mutator.rs
+@@ -1176,7 +1176,7 @@ impl<'doc> DocumentMutator<'doc> {
+                         self.doc.id(),
+                         None, // Don't pass node_id, we'll handle it via pending_images
+                         self.doc.shell_provider.clone(),
+-                        ImageHandler::new(ImageType::Image),
++                        ImageHandler::new(ImageType::Image, self.doc.font_ctx.clone()),
+                     ),
+                 );
+             }
+diff --git a/packages/blitz-dom/src/net.rs b/packages/blitz-dom/src/net.rs
+index 0d39ca4..c3ee215 100644
+--- a/packages/blitz-dom/src/net.rs
++++ b/packages/blitz-dom/src/net.rs
+@@ -1,5 +1,6 @@
+ use blitz_traits::node_id::NodeId;
+ use selectors::context::QuirksMode;
++use std::sync::Mutex;
+ use std::sync::atomic::Ordering as Ao;
+ use std::{
+     io::Cursor,
+@@ -549,11 +550,13 @@ impl NetHandler for ResourceHandler<DocumentSrcHandler> {
  }
  
- #[cfg(feature = "svg")]
--use std::sync::{Arc, LazyLock};
-+use std::sync::{Arc, LazyLock, RwLock};
- #[cfg(feature = "svg")]
- use usvg::fontdb;
-+
- #[cfg(feature = "svg")]
--pub(crate) static FONT_DB: LazyLock<Arc<fontdb::Database>> = LazyLock::new(|| {
-+static SYSTEM_FONT_DB: LazyLock<Arc<fontdb::Database>> = LazyLock::new(|| {
-     let mut db = fontdb::Database::new();
-     db.load_system_fonts();
-     Arc::new(db)
- });
+ pub struct ImageHandler {
++    /// Needed so SVG `<text>` resolves through the document's font collection.
++    font_ctx: Arc<Mutex<parley::FontContext>>,
+     kind: ImageType,
+ }
+ impl ImageHandler {
+-    pub fn new(kind: ImageType) -> Self {
+-        Self { kind }
++    pub fn new(kind: ImageType, font_ctx: Arc<Mutex<parley::FontContext>>) -> Self {
++        Self { kind, font_ctx }
+     }
+ }
+ 
+@@ -588,7 +591,7 @@ impl ImageHandler {
+         #[cfg(feature = "svg")]
+         let svg_err = {
+             use crate::util::parse_svg_image;
+-            match parse_svg_image(&bytes) {
++            match parse_svg_image(&bytes, self.font_ctx.clone()) {
+                 Ok(svg) => return Ok(Resource::Svg(self.kind, svg)),
+                 Err(e) => e.to_string(),
+             }
+diff --git a/packages/blitz-dom/src/util.rs b/packages/blitz-dom/src/util.rs
+index dcad882..8170238 100644
+--- a/packages/blitz-dom/src/util.rs
++++ b/packages/blitz-dom/src/util.rs
+@@ -4,6 +4,13 @@ use keyboard_types::Modifiers;
+ use std::borrow::Cow;
+ use style::color::AbsoluteColor;
  
 +#[cfg(feature = "svg")]
-+static SUPPLIED_FONT_DB: RwLock<Option<Arc<fontdb::Database>>> = RwLock::new(None);
++use parley::FontContext;
++#[cfg(feature = "svg")]
++use std::sync::{Arc, Mutex};
++#[cfg(feature = "svg")]
++use usvg::fontdb;
 +
-+/// Register the font faces used for SVG `<text>`.
+ #[cfg(target_os = "macos")]
+ pub(crate) const ACTION_MOD: Modifiers = Modifiers::SUPER;
+ #[cfg(not(target_os = "macos"))]
+@@ -39,16 +46,157 @@ pub fn decode_font_bytes(bytes: &[u8]) -> Cow<'_, [u8]> {
+     }
+ }
+ 
++/// SVG text font resolution.
 +///
-+/// SVG text is shaped through usvg's own font database, which is separate from
-+/// the `parley::FontContext` in `DocumentConfig`. Without this, that database
-+/// is populated only by `load_system_fonts()`, so SVG text renders blank in any
-+/// environment that has none — notably WASM.
-+#[cfg(feature = "svg")]
-+pub fn register_svg_fonts(faces: &[&[u8]]) {
-+    let mut db = fontdb::Database::new();
-+    for face in faces {
-+        db.load_font_data(face.to_vec());
-+    }
-+    let family = db.faces().next().map(|face| face.families[0].0.clone());
-+    if let Some(name) = family {
-+        db.set_sans_serif_family(name.clone());
-+        db.set_serif_family(name.clone());
-+        db.set_monospace_family(name.clone());
-+        db.set_cursive_family(name.clone());
-+        db.set_fantasy_family(name);
-+    }
-+    *SUPPLIED_FONT_DB.write().unwrap() = Some(Arc::new(db));
-+}
++/// usvg keeps its own `fontdb`, filled by default only from system fonts.
++/// Resolving through Fontique instead means `DocumentConfig::font_ctx` covers
++/// SVG text as well as HTML text.
+ #[cfg(feature = "svg")]
+-use std::sync::{Arc, LazyLock};
+-#[cfg(feature = "svg")]
+-use usvg::fontdb;
+-#[cfg(feature = "svg")]
+-pub(crate) static FONT_DB: LazyLock<Arc<fontdb::Database>> = LazyLock::new(|| {
+-    let mut db = fontdb::Database::new();
+-    db.load_system_fonts();
+-    Arc::new(db)
+-});
++mod svg_fonts {
++    use parley::FontContext;
++    use parley::fontique::{
++        Attributes, Blob, FontStyle, FontWeight, FontWidth, GenericFamily, QueryFamily, QueryFont,
++        QueryStatus,
++    };
++    use std::collections::HashMap;
++    use std::sync::{Arc, Mutex};
++    use usvg::fontdb;
 +
-+#[cfg(feature = "svg")]
-+pub(crate) fn svg_font_db() -> Arc<fontdb::Database> {
-+    if let Some(db) = SUPPLIED_FONT_DB.read().unwrap().as_ref() {
-+        return Arc::clone(db);
-+    }
-+    Arc::clone(&SYSTEM_FONT_DB)
-+}
++    /// Faces already copied into usvg's database, keyed by blob address and index.
++    type Cache = Arc<Mutex<HashMap<(usize, u32), fontdb::ID>>>;
 +
++    pub(crate) fn resolver(font_ctx: Arc<Mutex<FontContext>>) -> usvg::FontResolver<'static> {
++        let cache = Cache::default();
++        usvg::FontResolver {
++            select_font: select_font(font_ctx.clone(), cache.clone()),
++            select_fallback: select_fallback(font_ctx, cache),
++        }
++    }
++
++    fn select_font(
++        font_ctx: Arc<Mutex<FontContext>>,
++        cache: Cache,
++    ) -> usvg::FontSelectionFn<'static> {
++        Box::new(move |font, db| {
++            let families: Vec<QueryFamily<'_>> = font.families().iter().map(family).collect();
++            let attributes = Attributes::new(
++                width(font.stretch()),
++                style(font.style()),
++                FontWeight::new(font.weight() as f32),
++            );
++
++            let mut ctx = font_ctx.lock().unwrap();
++            let ctx = &mut *ctx;
++            let mut query = ctx.collection.query(&mut ctx.source_cache);
++            query.set_families(families);
++            query.set_attributes(attributes);
++
++            let mut found = None;
++            query.matches_with(|candidate| {
++                found = Some(candidate.clone());
++                QueryStatus::Stop
++            });
++            drop(query);
++
++            adopt(&cache, db, &found?)
++        })
++    }
++
++    fn select_fallback(
++        font_ctx: Arc<Mutex<FontContext>>,
++        cache: Cache,
++    ) -> usvg::FallbackSelectionFn<'static> {
++        Box::new(move |ch, used, db| {
++            let mut ctx = font_ctx.lock().unwrap();
++            let ctx = &mut *ctx;
++            let mut query = ctx.collection.query(&mut ctx.source_cache);
++            query.set_families([
++                QueryFamily::from(GenericFamily::SansSerif),
++                QueryFamily::from(GenericFamily::Serif),
++                QueryFamily::from(GenericFamily::Monospace),
++            ]);
++
++            let mut found = None;
++            query.matches_with(|candidate| {
++                if covers(candidate, ch) {
++                    found = Some(candidate.clone());
++                    QueryStatus::Stop
++                } else {
++                    QueryStatus::Continue
++                }
++            });
++            drop(query);
++
++            let id = adopt(&cache, db, &found?)?;
++            (!used.contains(&id)).then_some(id)
++        })
++    }
++
++    fn covers(font: &QueryFont, ch: char) -> bool {
++        font.charmap()
++            .is_some_and(|charmap| charmap.map(ch).is_some())
++    }
++
++    /// Copy a Fontique face into usvg's database, once, and return its id.
++    fn adopt(
++        cache: &Cache,
++        db: &mut Arc<fontdb::Database>,
++        font: &QueryFont,
++    ) -> Option<fontdb::ID> {
++        let key = (font.blob.as_ref().as_ptr() as usize, font.index);
++        if let Some(id) = cache.lock().unwrap().get(&key) {
++            return Some(*id);
++        }
++
++        let source = fontdb::Source::Binary(Arc::new(Bytes(font.blob.clone())));
++        let ids = Arc::make_mut(db).load_font_source(source);
++        let id = *ids.get(font.index as usize).or_else(|| ids.first())?;
++        cache.lock().unwrap().insert(key, id);
++        Some(id)
++    }
++
++    fn family(family: &usvg::FontFamily) -> QueryFamily<'_> {
++        match family {
++            usvg::FontFamily::Named(name) => QueryFamily::Named(name),
++            usvg::FontFamily::Serif => GenericFamily::Serif.into(),
++            usvg::FontFamily::SansSerif => GenericFamily::SansSerif.into(),
++            usvg::FontFamily::Cursive => GenericFamily::Cursive.into(),
++            usvg::FontFamily::Fantasy => GenericFamily::Fantasy.into(),
++            usvg::FontFamily::Monospace => GenericFamily::Monospace.into(),
++        }
++    }
++
++    fn style(style: usvg::FontStyle) -> FontStyle {
++        match style {
++            usvg::FontStyle::Normal => FontStyle::Normal,
++            usvg::FontStyle::Italic => FontStyle::Italic,
++            usvg::FontStyle::Oblique => FontStyle::Oblique(None),
++        }
++    }
++
++    fn width(stretch: usvg::FontStretch) -> FontWidth {
++        match stretch {
++            usvg::FontStretch::UltraCondensed => FontWidth::ULTRA_CONDENSED,
++            usvg::FontStretch::ExtraCondensed => FontWidth::EXTRA_CONDENSED,
++            usvg::FontStretch::Condensed => FontWidth::CONDENSED,
++            usvg::FontStretch::SemiCondensed => FontWidth::SEMI_CONDENSED,
++            usvg::FontStretch::Normal => FontWidth::NORMAL,
++            usvg::FontStretch::SemiExpanded => FontWidth::SEMI_EXPANDED,
++            usvg::FontStretch::Expanded => FontWidth::EXPANDED,
++            usvg::FontStretch::ExtraExpanded => FontWidth::EXTRA_EXPANDED,
++            usvg::FontStretch::UltraExpanded => FontWidth::ULTRA_EXPANDED,
++        }
++    }
++
++    /// `fontdb::Source::Binary` wants `AsRef<[u8]>`; `Blob` derefs to a slice.
++    struct Bytes(Blob<u8>);
++
++    impl AsRef<[u8]> for Bytes {
++        fn as_ref(&self) -> &[u8] {
++            self.0.as_ref()
++        }
++    }
++}
+ 
  /// Which kind of CSS image layer list (`background-image` or `mask-image`) to
  /// flush from style to dedicated storage on the node.
- #[derive(Clone, Copy, Debug)]
-@@ -157,7 +192,7 @@ pub fn walk_tree(indent: usize, node: &Node) {
+@@ -155,9 +303,14 @@ pub fn walk_tree(indent: usize, node: &Node) {
+ 
+ /// Parse an SVG image.
  #[cfg(feature = "svg")]
- pub(crate) fn parse_svg_image(source: &[u8]) -> Result<crate::node::SvgImageData, usvg::Error> {
+-pub(crate) fn parse_svg_image(source: &[u8]) -> Result<crate::node::SvgImageData, usvg::Error> {
++pub(crate) fn parse_svg_image(
++    source: &[u8],
++    font_ctx: Arc<Mutex<FontContext>>,
++) -> Result<crate::node::SvgImageData, usvg::Error> {
      let options = usvg::Options {
 -        fontdb: Arc::clone(&*FONT_DB),
-+        fontdb: svg_font_db(),
++        // Left empty: the resolver adds faces from the document's collection.
++        fontdb: Arc::new(fontdb::Database::new()),
++        font_resolver: svg_fonts::resolver(font_ctx),
          ..Default::default()
      };
      crate::node::SvgImageData::from_data(source, &options)

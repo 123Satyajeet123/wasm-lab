@@ -8,18 +8,25 @@ git apply ../../patches/01-blitz-dom-svg-fonts.patch
 git apply ../../patches/02-wpt-runner-wasi.patch
 ```
 
-### 01 — blitz-dom: let callers supply the SVG font database
+### 01 - blitz-dom: resolve SVG text through the document's font collection
 
-The bug this repo found. `FONT_DB` is a private `LazyLock` filled only by
-`load_system_fonts()`, so SVG `<text>` renders blank wherever system fonts do
-not exist — which is exactly the WASM configuration Blitz documents.
-`DocumentConfig.font_ctx` configures Parley and never reaches it.
+The bug this repo found. usvg keeps its own `fontdb`, filled by default only
+from `load_system_fonts()`, so SVG `<text>` renders blank wherever those do not
+exist - which is the WASM configuration Blitz documents.
+`DocumentConfig::font_ctx` configured Parley and never reached it.
 
-Adds `register_svg_fonts(&[&[u8]])`; `FONT_DB` becomes a fallback behind an
-optional supplied database. Measured on the repro: SVG ink pixels go from 0 to
-matching the native render.
+Hands usvg a `FontResolver` backed by the same Fontique collection HTML text
+uses, so `font_ctx` is the only font knob. usvg's database starts empty and the
+resolver adds faces on demand.
 
-Filed upstream: https://github.com/DioxusLabs/blitz/issues/897
+Measured on `repro/svg-text-blank-on-wasm.html`, with `font_ctx` as the only
+font configuration: SVG ink pixels go 0 -> 5183, matching the native render, on
+both the host and `wasm32-wasip1`.
+
+Filed as https://github.com/DioxusLabs/blitz/issues/897, PR
+https://github.com/DioxusLabs/blitz/pull/898. The first version of that PR added
+a second font database; the maintainers asked for the resolver instead, which is
+what this patch now is.
 
 ### 02 — wpt runner: run under WASI
 

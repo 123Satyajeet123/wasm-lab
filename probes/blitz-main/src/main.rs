@@ -52,9 +52,6 @@ fn main() {
     let mut html = String::new();
     std::io::stdin().read_to_string(&mut html).expect("read stdin");
 
-    // The SVG font database is separate from parley's and must be supplied too.
-    blitz_dom::register_svg_fonts(&FACES);
-
     let mut doc = HtmlDocument::from_html(
         &html,
         DocumentConfig {
